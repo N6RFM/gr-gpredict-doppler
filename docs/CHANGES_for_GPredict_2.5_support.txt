@@ -1,0 +1,127 @@
+doppler.py -- Change Narrative for Gpredict 2.5 Support
+=========================================================
+Modified by N6RFM and Claude AI  13April26
+Branch: GPredict_2.5_support
+
+
+BACKGROUND
+----------
+The original doppler.py was written in 2015 by Wolfgang Nagele to interface
+GNU Radio with Gpredict 2.3 via the hamlib network protocol. It worked
+reliably for years because Gpredict 2.3 sent only simple single-character
+commands: F for RX frequency, I for TX frequency, S for split mode, AOS/LOS
+for satellite events, and q to quit.
+
+Gpredict 2.4 and 2.5 extended the hamlib protocol significantly. These
+versions added long-form backslash-prefixed commands such as \set_vfo_opt,
+\chk_vfo, \dump_state, \get_vfo, \get_ptt, and \set_ptt. The original code
+had no handlers for any of these, and more critically, it never sent
+"RPRT 0" back to Gpredict when it encountered an unknown command. Since
+Gpredict waits for RPRT 0 after every single command before sending the next
+one, the very first unrecognized command -- \set_vfo_opt 1, sent immediately
+upon connection -- caused the entire session to deadlock silently. The
+connection appeared established but was completely frozen.
+
+Reference: https://github.com/csete/gpredict/commit/2da2d2090daf6fd2ffb64df3a3e6ca50c6f3e176
+
+
+THE ROOT CAUSE FIX -- Unknown Command Fallback
+-----------------------------------------------
+The most critical change is in the unknown command fallback at the bottom of
+the command loop. The original code printed a warning message but never
+replied to Gpredict. The updated code now always sends "RPRT 0" for any
+unrecognized command. This ensures the session never stalls on a future
+unknown command from even newer versions of Gpredict, making the code
+forward-compatible.
+
+
+COMMAND NORMALIZATION -- Backslash Stripping
+---------------------------------------------
+A single line was added at the top of the command processing loop:
+
+    cmd = curCommand.lstrip('\\')
+
+This strips the leading backslash that Gpredict 2.5 prefixes on long-form
+commands. All command handlers now check against cmd (the normalized form)
+rather than curCommand, so both "F 145900000" and "\set_freq 145900000" hit
+the same handler without needing duplicate logic. The original curCommand is
+preserved for debug console output so the user always sees exactly what
+Gpredict sent.
+
+
+NEW COMMAND HANDLERS
+---------------------
+Several new handlers were added for commands that Gpredict 2.5 sends as part
+of its startup handshake and ongoing tracking cycle:
+
+set_vfo_opt / set_vfo
+  Gpredict 2.5 sends \set_vfo_opt 1 as the very first command after
+  connecting to enable VFO optimization mode, followed by \set_vfo VFOA to
+  select a VFO. These are now acknowledged with RPRT 0. This was the primary
+  cause of the hang in all affected installations.
+
+chk_vfo
+  Sent immediately after set_vfo_opt, this asks whether the rig supports VFO
+  commands. Responding with "0\nRPRT 0\n" tells Gpredict "no VFO support
+  needed," which is correct for a virtual device and has the useful side
+  effect of suppressing further VFO-related commands on each tracking cycle,
+  keeping the session cleaner.
+
+dump_state
+  Gpredict 2.5 sends \dump_state on every new connection to probe rig
+  capabilities before sending any other commands. The new handler returns a
+  minimal but valid hamlib capability response describing a generic wideband
+  receive-only device. Without this handler, every new connection deadlocked
+  immediately.
+
+get_vfo / get_split_vfo
+  Gpredict polls these to query the active VFO and split state. Both return
+  safe defaults (VFOA and split off respectively).
+
+get_ptt / set_ptt
+  Gpredict 2.5 polls PTT (transmit) state and may assert it. Since this is a
+  receive-only virtual device, get_ptt always returns 0 (not transmitting)
+  and set_ptt is acknowledged but ignored.
+
+
+MISSING foundCommand = True FLAGS
+-----------------------------------
+Several handlers in the original code were missing "foundCommand = True",
+which caused spurious "unknown command" warnings to be printed in the console
+even for commands that were being handled correctly. This was fixed for S
+(set_split_vfo), AOS, LOS, and q.
+
+
+RESPONSE FORMAT UPDATES
+------------------------
+The responses to get_freq and get_split_freq were updated from the
+non-standard "f: <hz>\n" format to the correct hamlib long-form
+"freq=<hz>\nRPRT 0\n". Gpredict 2.5's response parser expects the standard
+format.
+
+
+BUG FIX IN stop()
+------------------
+The original stop() method contained a bug where self.sock.shutdown() was
+called on the doppler class instance, which has no self.sock attribute --
+only the doppler_runner thread has that. This raised an AttributeError
+silently inside an except block, meaning the forced connection used to
+unblock accept() was made but never properly torn down. The fix changes it
+to s.close() on the local socket variable, which is sufficient since
+stopThread=True causes the runner thread to exit cleanly after accept()
+unblocks.
+
+
+CODE STYLE
+-----------
+Indentation was updated from 2-space to 4-space throughout to conform to
+PEP 8. The sendState() method was simplified from an if/else block to a
+single ternary expression with identical behavior.
+
+
+GPREDICT 2.5 STARTUP SEQUENCE (now handled cleanly)
+-----------------------------------------------------
+  \set_vfo_opt 1   ->  RPRT 0
+  \chk_vfo         ->  0 + RPRT 0  (tells Gpredict no VFO ops needed)
+  \dump_state      ->  minimal rig caps + RPRT 0
+  F <hz>           ->  RPRT 0  (frequency updates follow normally)
